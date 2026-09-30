@@ -12,6 +12,7 @@ import json
 import os
 
 from sqlalchemy.orm import Session
+from groq import Groq
 
 from app import models
 from app.agent import Agent
@@ -54,52 +55,92 @@ def _tool_schema():
     return tools
 
 
-class LLMAgent(Agent):
-    """Calls the Anthropic API to decide each action dynamically."""
+class LLMAgent:
+    def __init__(self, model_name: str = "openai/gpt-oss-120b"):
+        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.model = model_name
 
-    def __init__(self):
-        import anthropic
-        self.client = anthropic.Anthropic()
+        # 1. Define tools in JSON schema format for Groq
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_order",
+                    "description": "Retrieve details about an order by order_id.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "order_id": {"type": "string", "description": "The UUID or ID of the order"}
+                        },
+                        "required": ["order_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "check_refund_policy",
+                    "description": "Check if an order is eligible for a refund according to company policy.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "order_id": {"type": "string", "description": "The UUID or ID of the order"}
+                        },
+                        "required": ["order_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "issue_refund",
+                    "description": "Issue a full refund for a verified eligible order.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "order_id": {"type": "string", "description": "The UUID or ID of the order"}
+                        },
+                        "required": ["order_id"]
+                    }
+                }
+            }
+        ]
 
-    def solve(self, env: Environment, db: Session, environment_id: str, task: Task):
-        order = db.query(models.Order).filter_by(environment_id=environment_id).first()
-        customer_id = order.customer_id
+    def run_step(self, user_prompt: str, action_history: list):
+        """
+        Queries Llama 3.3 via Groq to decide the next action based on prompt and history.
+        """
+        messages = [
+            {"role": "system", "content": "You are an automated customer service resolution agent. Follow policy strictly. Use provided tools to investigate and resolve requests."}
+        ]
+        
+        # Append action history to conversation context
+        for entry in action_history:
+            messages.append({"role": "user", "content": f"Action Taken: {entry['action']}, Result: {entry['result']}"})
 
-        system = (
-            "You are a customer support agent. You can only act through the tools "
-            "provided - you have no other way to read or change data. Call 'finish' "
-            "once the task is resolved. Do not call more than "
-            f"{task.max_steps} actions total."
+        messages.append({"role": "user", "content": user_prompt})
+
+        # Send request to Groq API
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=self.tools,
+            tool_choice="auto"
         )
-        messages = [{
-            "role": "user",
-            "content": (
-                f"Task: {task.description}\n"
-                f"order_id: {order.id}\ncustomer_id: {customer_id}\n"
-                "Resolve this using the available tools."
-            ),
-        }]
 
-        for _ in range(task.max_steps):
-            response = self.client.messages.create(
-                model=MODEL, max_tokens=1024, system=system,
-                messages=messages, tools=_tool_schema(),
-            )
-            messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
 
-            tool_calls = [b for b in response.content if b.type == "tool_use"]
-            if not tool_calls or any(c.name == "finish" for c in tool_calls):
-                break
-
-            tool_results = []
-            for call in tool_calls:
-                outcome = env.execute(call.name, call.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": call.id,
-                    "content": json.dumps(outcome["result"]),
-                })
-            messages.append({"role": "user", "content": tool_results})
-
-            if response.stop_reason != "tool_use":
-                break
+        # If model decides to call a tool/action
+        if message.tool_calls:
+            tool_call = message.tool_calls[0]
+            return {
+                "type": "action",
+                "action_name": tool_call.function.name,
+                "params": json.loads(tool_call.function.arguments)
+            }
+        
+        # Otherwise, model provides a final text response
+        return {
+            "type": "finish",
+            "content": message.content
+        }
